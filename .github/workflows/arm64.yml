@@ -1,0 +1,423 @@
+name: CyIME Full Offline ARM64 (Corrected)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream release tag (blank = latest)"
+        required: false
+        type: string
+        default: "1.15.34"
+      edition:
+        description: "Official-style full (~700-800 MB) or expanded 10 models (larger)"
+        required: true
+        type: choice
+        options:
+          - official-full
+          - expanded-10
+        default: expanded-10
+      minimum_version_code:
+        description: "Optional versionCode override when above the calculated value"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cyime-fresh-offline
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 1. Resolve source release
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          REF="$SOURCE_REF"
+          if [ -z "$REF" ]; then
+            REF="$(gh api repos/Cyletix/CyIME/releases/latest --jq .tag_name)"
+          fi
+          [ -n "$REF" ] || { echo "Cannot resolve release tag"; exit 1; }
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Using source tag: $REF"
+
+      - name: 2. Checkout original CyIME source
+        uses: actions/checkout@v4
+        with:
+          repository: Cyletix/CyIME
+          ref: ${{ steps.source.outputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 3. Configure Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: 4. Configure Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: 5. Install Android dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.14206865" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake
+          chmod +x gradlew
+
+      - name: 6. Patch offline and ARM64, preserving clipboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          manifest_file = Path("app/src/main/AndroidManifest.xml")
+          gradle_file = Path("app/build.gradle.kts")
+          m = manifest_file.read_text(encoding="utf-8")
+          g = gradle_file.read_text(encoding="utf-8")
+          if 'xmlns:tools=' not in m:
+              raise SystemExit("Upstream XML namespace changed")
+
+          blocked = ("INTERNET", "ACCESS_NETWORK_STATE",
+                     "ACCESS_WIFI_STATE", "REQUEST_INSTALL_PACKAGES")
+          for permission in blocked:
+              pattern = (r'(?m)^[ \t]*<uses-permission(?:-sdk-23)?\b'
+                         r'[^\n>]*android:name="android\.permission\.'
+                         + re.escape(permission) + r'"[^\n>]*/>[ \t]*\n?')
+              m = re.sub(pattern, "", m)
+          removals = "".join(
+              '    <uses-permission android:name="android.permission.'
+              + permission + '" tools:node="remove" />\n'
+              for permission in blocked)
+          application = re.search(r'(?m)^[ \t]*<application\b', m)
+          if application is None:
+              raise SystemExit("Upstream application element missing")
+          m = m[:application.start()] + removals + m[application.start():]
+          manifest_file.write_text(m, encoding="utf-8")
+
+          # Windows sync code is retained; network permission is removed.
+          if ("tasks-builtin-sync.gradle.kts" not in g or
+                  "generated/builtin-sync-assets" not in g):
+              raise SystemExit("Windows-sync build wiring changed")
+
+          g, n1 = re.subn(
+              r'(?m)^[ \t]*abiFilters\s*\+=\s*listOf\([^\n)]*\)[ \t]*\n',
+              "", g)
+          g, n2 = re.subn(
+              r'(?m)^([ \t]*)include\("armeabi-v7a", "arm64-v8a", "x86", "x86_64"\)',
+              r'\1include("arm64-v8a")', g)
+          g, n3 = re.subn(
+              r'isUniversalApk\s*=\s*true', 'isUniversalApk = false', g)
+          if (n1, n2, n3) != (1, 1, 1):
+              raise SystemExit(f"ABI settings changed: {n1}, {n2}, {n3}")
+          gradle_file.write_text(g, encoding="utf-8")
+          print("PATCH OK: no Internet, ARM64 only, clipboard retained")
+          PY
+
+      - name: 7. Add the official complete T9 model to Rime assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path("app/src/main/java/com/kingzcheung/xime/model/CandidateModelCatalog.kt").read_text()
+          assert 'v3-ls-tri-c3' in src
+          assert '11cee2cbd87f42cb18ddcd2b38ac2c2ef9e4a778c64da68f8c6f615e4050c867' in src
+          assert '212706156L' in src
+          PY
+          MODEL="app/src/main/assets/rime_chinese/t9_ngram.lm"
+          mkdir -p "$(dirname "$MODEL")"
+          curl -fL --retry 5 --retry-all-errors \
+            "https://github.com/Cyletix/CyIME/releases/download/models/t9_ngram-v3-ls-tri-c3.lm" \
+            -o "$MODEL"
+          test "$(stat -c%s "$MODEL")" = "212706156"
+          echo "11cee2cbd87f42cb18ddcd2b38ac2c2ef9e4a778c64da68f8c6f615e4050c867  $MODEL" | sha256sum -c -
+          echo "T9 model downloaded to Rime assets"
+
+      - name: 8. Extend official six-model bundle for X-ASR, formula and gloss
+        if: ${{ inputs.edition == 'expanded-10' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import importlib.util
+
+          root = Path("app/src/main/java/com/kingzcheung/xime")
+          installer = root / "model/BundledModelInstaller.kt"
+          kotlin = installer.read_text(encoding="utf-8")
+
+          # The on-device installer validates each manifest model against its allowlist.
+          old = ("SpeechModelCatalog.PARAFORMER, SpeechModelCatalog.SENSEVOICE, "
+                 "BuiltinModelCatalog.SPEAKER_MODEL)")
+          new = ("SpeechModelCatalog.PARAFORMER, SpeechModelCatalog.SENSEVOICE, "
+                 'BuiltinModelCatalog.SPEAKER_MODEL,\n'
+                 '        SpeechModelCatalog.XASR, "handwriting-formula", "candidate-gloss")')
+          if kotlin.count(old) != 1:
+              raise SystemExit("PATCH FAILED: BundledModelInstaller allowlist changed")
+          installer.write_text(kotlin.replace(old, new, 1), encoding="utf-8")
+
+          path = Path("scripts/prepare-bundled-models.py")
+          src = path.read_text(encoding="utf-8")
+
+          def replace_once(old, new, name):
+              global src
+              if src.count(old) != 1:
+                  raise SystemExit(f"PATCH FAILED: {name} (matches={src.count(old)})")
+              src = src.replace(old, new, 1)
+
+          # Preserve the official six model entries. The T9 model is intentionally
+          # NOT added here: it belongs to the separate Rime asset mechanism.
+          replace_once(
+              "def digest(path):",
+              "INCLUDED.update({'handwriting-formula', 'candidate-gloss', 'xasr-zh-en-punct-int8'})\n\ndef digest(path):",
+              "extend exact official model IDs",
+          )
+
+          # Kotlin joins the model download base URL with filenames (RELEASE + "...").
+          # Expand those expressions before parsing ModelFile(...) entries.
+          anchor = "        for block in source.split('ModelInfo(')[1:]:"
+          expansion = (
+              "        release = constants.get('RELEASE')\n"
+              "        if release:\n"
+              '            source = re.sub(r\'\\bRELEASE\\s*\\+\\s*"([^"]+)"\',\n'
+              '                            lambda match: \'"\' + release + match.group(1) + \'"\', source)\n'
+          )
+          replace_once(anchor, expansion + anchor, "expand RELEASE URLs")
+
+          # Formula-handwriting has multiline ModelFile declarations.
+          replace_once(
+              r'ModelFile\("([^"]+)", "([^"]*)", "([^"]*)", (\d+)L[,)]',
+              r'ModelFile\(\s*"([^"]+)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+)L\s*[,)]',
+              "read multiline model metadata",
+          )
+
+          path.write_text(src, encoding="utf-8")
+          spec = importlib.util.spec_from_file_location("cyime_prep", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+
+          expected = {
+              "ochwpro", "predictive-text-small", "predictive-text-base",
+              "paraformer-zh-en-int8", "sensevoice-multilingual-int8",
+              "speaker-campplus-zh", "handwriting-formula", "candidate-gloss",
+              "xasr-zh-en-punct-int8",
+          }
+          models = module.catalog()
+          actual = {m["id"] for m in models}
+          if actual != expected or len(models) != len(expected):
+              raise SystemExit(f"Wrong bundled models: {actual ^ expected}")
+          by_id = {m["id"]: m for m in models}
+          required = {
+              "handwriting-formula": {
+                  "formula_encoder.onnx", "formula_decoder.onnx",
+                  "formula_vocab.json", "formula_meta.json",
+              },
+              "candidate-gloss": {"cyime_gloss-v12.tsv"},
+              "xasr-zh-en-punct-int8": {
+                  "encoder-epoch-99-avg-1.int8.onnx",
+                  "decoder-epoch-99-avg-1.onnx",
+                  "joiner-epoch-99-avg-1.int8.onnx", "tokens.txt",
+              },
+          }
+          for model_id, required_names in required.items():
+              data = by_id[model_id]
+              found = {f["name"] for f in data["files"]}
+              if found != required_names or len(data["files"]) != len(required_names):
+                  raise SystemExit(f"Wrong files for {model_id}: {found ^ required_names}")
+              if not data["archive"]:
+                  for file in data["files"]:
+                      if not file["url"].startswith("https://") or len(file["sha256"]) != 64 or file["size"] <= 0:
+                          raise SystemExit(f"Incomplete metadata: {model_id}/{file['name']}")
+          xasr = by_id["xasr-zh-en-punct-int8"]
+          assert xasr["version"] == "2026-06-03"
+          assert xasr["archive"] and xasr["archive"][1] == "5d02c36d7b44e886b7c8f0d8e051f8713acab96c264bb6ef9e718be39a6a2224"
+          assert by_id["candidate-gloss"]["version"] == "v12"
+          assert by_id["handwriting-formula"]["version"] == "v1"
+          print("PASS: 9 ordinary model definitions including X-ASR, formula and gloss")
+          print("PASS: T9 remains separate in Rime assets")
+          PY
+
+      - name: 9. Build selected full APK
+        id: build
+        shell: bash
+        env:
+          EDITION: ${{ inputs.edition }}
+          MIN_CODE: ${{ inputs.minimum_version_code }}
+        run: |
+          set -euo pipefail
+          BASE_CODE=$(grep -oP '^\s*versionCode = \K[0-9]+' app/build.gradle.kts | head -n 1)
+          BASE_NAME=$(grep -oP '^\s*versionName = "\K[^"]+' app/build.gradle.kts | head -n 1)
+          [ -n "$BASE_CODE" ] && [ -n "$BASE_NAME" ] || exit 1
+          VERSION_CODE=$((BASE_CODE + 500000 + GITHUB_RUN_NUMBER))
+          if [ -n "$MIN_CODE" ]; then
+            [[ "$MIN_CODE" =~ ^[0-9]+$ ]] || { echo "Invalid minimum_version_code"; exit 1; }
+            if (( MIN_CODE > VERSION_CODE )); then VERSION_CODE="$MIN_CODE"; fi
+          fi
+          if [ "$EDITION" = "official-full" ]; then
+            IDS="ochwpro,predictive-text-base,predictive-text-small,sensevoice-multilingual-int8,speaker-campplus-zh"
+          elif [ "$EDITION" = "expanded-10" ]; then
+            IDS="ochwpro,predictive-text-base,predictive-text-small,sensevoice-multilingual-int8,speaker-campplus-zh,paraformer-zh-en-int8,handwriting-formula,candidate-gloss,xasr-zh-en-punct-int8"
+          else
+            echo "Unsupported edition: $EDITION"; exit 1
+          fi
+          VERSION_NAME="${BASE_NAME}-offline"
+          echo "base_name=$BASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "Edition=$EDITION, models=$IDS, versionCode=$VERSION_CODE"
+          rm -f app/keystore.properties
+          ./gradlew :app:assembleRelease \
+            -PbundleModels=true \
+            -PbundledModelIds="$IDS" \
+            -PpythonExecutable=python3 \
+            -PversionCode="$VERSION_CODE" \
+            -PversionName="$VERSION_NAME" \
+            --no-daemon
+
+      - name: 10. Sign with existing CYIME secrets
+        id: signed
+        shell: bash
+        env:
+          KEY_B64: ${{ secrets.CYIME_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.CYIME_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.CYIME_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.CYIME_KEY_PASSWORD }}
+          EDITION: ${{ inputs.edition }}
+          BASE_NAME: ${{ steps.build.outputs.base_name }}
+        run: |
+          set -euo pipefail
+          for x in KEY_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!x:-}" ] || { echo "Missing signing secret: $x"; exit 1; }
+          done
+          APK_IN=$(find app/build/outputs/apk/release -maxdepth 1 \
+            -type f -name '*-full-arm64-v8a.apk' -print -quit)
+          [ -n "$APK_IN" ] || { echo "Full ARM64 APK missing"; exit 1; }
+          BT=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -n 1)
+          [ -x "$BT/apksigner" ] || exit 1
+          KEYSTORE="$RUNNER_TEMP/cyime-signing.p12"
+          ALIGNED="$RUNNER_TEMP/cyime-aligned.apk"
+          APK_OUT="$RUNNER_TEMP/CyIME-${BASE_NAME}-${EDITION}-offline-arm64-v8a.apk"
+          trap 'rm -f "$KEYSTORE" "$ALIGNED"' EXIT
+          printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE"
+          "$BT/zipalign" -f -P 16 4 "$APK_IN" "$ALIGNED"
+          "$BT/apksigner" sign \
+            --ks "$KEYSTORE" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            --out "$APK_OUT" "$ALIGNED"
+          "$BT/apksigner" verify --min-sdk-version 23 --verbose --print-certs "$APK_OUT"
+          echo "apk=$APK_OUT" >> "$GITHUB_OUTPUT"
+          echo "bt=$BT" >> "$GITHUB_OUTPUT"
+
+      - name: 11. Verify permissions, models, T9, architecture and signature
+        shell: bash
+        env:
+          APK: ${{ steps.signed.outputs.apk }}
+          BT: ${{ steps.signed.outputs.bt }}
+          EDITION: ${{ inputs.edition }}
+          EXPECTED_VERSION_CODE: ${{ steps.build.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          "$BT/aapt" dump permissions "$APK" | tee permissions.txt
+          for P in INTERNET ACCESS_NETWORK_STATE ACCESS_WIFI_STATE REQUEST_INSTALL_PACKAGES; do
+            if grep -Fq "android.permission.$P'" permissions.txt; then
+              echo "Forbidden permission: $P"; exit 1
+            fi
+          done
+          "$BT/aapt" dump badging "$APK" > badging.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re
+          badging = Path("badging.txt").read_text(encoding="utf-8")
+          assert "package: name='com.cyletix.cyime'" in badging, "Unexpected package ID"
+          version = re.search(r"versionCode='(\d+)'", badging)
+          assert version and int(version[1]) == int(os.environ["EXPECTED_VERSION_CODE"]), "Wrong versionCode"
+          PY
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          apk_file = os.environ["APK"]
+          edition = os.environ["EDITION"]
+          normal = {"ochwpro", "predictive-text-base", "predictive-text-small",
+                    "sensevoice-multilingual-int8", "speaker-campplus-zh"}
+          extra = {"paraformer-zh-en-int8", "handwriting-formula",
+                   "candidate-gloss", "xasr-zh-en-punct-int8"}
+          expected = normal | (extra if edition == "expanded-10" else set())
+          t9_hash = "11cee2cbd87f42cb18ddcd2b38ac2c2ef9e4a778c64da68f8c6f615e4050c867"
+          t9_size = 212706156
+
+          def zip_hash(z, path):
+              h = hashlib.sha256()
+              with z.open(path) as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          with zipfile.ZipFile(apk_file) as apk:
+              paths = set(apk.namelist())
+              assert any(p.startswith("lib/arm64-v8a/") for p in paths), "Missing ARM64 libs"
+              assert not any(p.startswith(("lib/x86/", "lib/x86_64/", "lib/armeabi-v7a/"))
+                             for p in paths), "Unexpected ABI"
+              index = "assets/bundled-models/manifest.json"
+              assert index in paths, "Missing model manifest: not a full edition"
+              models = json.loads(apk.read(index))
+              ids = [m["id"] for m in models]
+              assert len(ids) == len(expected) and set(ids) == expected, f"Wrong models: {ids}"
+              for model in models:
+                  names = [item["name"] for item in model["files"]]
+                  assert len(names) == len(set(names)), f'Duplicate model file: {model["id"]}'
+                  for item in model["files"]:
+                      path = f'assets/bundled-models/{model["id"]}/{item["name"]}'
+                      assert path in paths, "Missing: " + path
+                      assert apk.getinfo(path).file_size == int(item["size"]), "Wrong size: " + path
+                      assert zip_hash(apk, path) == item["sha256"], "Wrong checksum: " + path
+              t9 = "assets/rime_chinese/t9_ngram.lm"
+              rime_manifest = "assets/rime-bundled-manifest.tsv"
+              assert t9 in paths and rime_manifest in paths, "T9 or Rime manifest missing"
+              assert apk.getinfo(t9).file_size == t9_size, "T9 has wrong size"
+              assert zip_hash(apk, t9) == t9_hash, "T9 checksum mismatch"
+              rows = [line.split("\t")
+                      for line in apk.read(rime_manifest).decode("utf-8").splitlines()]
+              assert [t9_hash, str(t9_size), "rime_chinese/t9_ngram.lm",
+                      "t9_ngram.lm"] in rows, "T9 absent from Rime sync manifest"
+              assert apk.testzip() is None, "APK ZIP integrity failure"
+
+          size = os.path.getsize(apk_file) / 1_000_000
+          minimum = 500 if edition == "official-full" else 700
+          assert size > minimum, f"Unexpectedly small full APK: {size:.1f} MB"
+          print(f"PASS: {edition}, {len(expected)} bundled ordinary models plus full T9")
+          print(f"PASS: {size:.1f} MB, no forbidden network permissions, asset hashes verified")
+          PY
+          "$BT/apksigner" verify --min-sdk-version 23 --verbose "$APK"
+          sha256sum "$APK"
+
+      - name: 12. Upload verified APK directly
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.signed.outputs.apk }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
