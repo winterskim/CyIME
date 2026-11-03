@@ -1,4 +1,4 @@
-name: CyIME Full Offline ARM64 (Clipboard Fix v3)
+name: CyIME Full Offline ARM64 (Clipboard Crash Fix v4)
 
 on:
   workflow_dispatch:
@@ -134,6 +134,40 @@ jobs:
               raise SystemExit(f"ABI settings changed: {n1}, {n2}, {n3}")
           gradle_file.write_text(g, encoding="utf-8")
           print("PATCH OK: no Internet, ARM64 only, clipboard retained")
+          PY
+
+      - name: 6.5. Prevent Windows discovery crash in offline builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("app/src/main/java/com/kingzcheung/xime/clipboard/sync/WindowsDevices.kt")
+          source = path.read_text(encoding="utf-8")
+          before = (
+              "    fun start() {\n"
+              "        if (listener != null) return\n"
+          )
+          after = (
+              "    fun start() {\n"
+              "        // An offline build cannot create NsdManager without INTERNET permission.\n"
+              "        // Keep the Windows sync code and settings screen, but skip discovery.\n"
+              "        if (context.checkSelfPermission(android.Manifest.permission.INTERNET) !=\n"
+              "            android.content.pm.PackageManager.PERMISSION_GRANTED) {\n"
+              '            _status.value = "离线版：跨设备同步不可用；本机剪贴板可以正常使用"\n'
+              "            return\n"
+              "        }\n"
+              "        if (listener != null) return\n"
+          )
+          if source.count(before) != 1:
+              raise SystemExit(
+                  "PATCH FAILED: WindowsDevices.start changed upstream; "
+                  "do not build without reviewing the code"
+              )
+          path.write_text(source.replace(before, after, 1), encoding="utf-8")
+          print("PASS: NSD discovery guarded when INTERNET permission is absent")
+          print("PASS: Windows sync source and settings screen preserved")
           PY
 
       - name: 7. Add the official complete T9 model to Rime assets
